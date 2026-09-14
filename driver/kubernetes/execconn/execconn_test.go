@@ -13,8 +13,10 @@ import (
 )
 
 // fakeExecutor stands in for the real SPDY exec stream. The connection is only
-// considered established once StreamWithContext starts reading stdin, matching the
-// real executor which copies stdin to the pod once all its streams are created.
+// considered established once StreamWithContext reads stdin, matching the real
+// executor which copies stdin to the pod once all its streams are created. It
+// reads stdin just enough to signal readiness and then stops consuming it, so a
+// write after the stream ends observes the closed pipe rather than being read.
 type fakeExecutor struct {
 	// startErr, if set, is returned before the stream is established, without ever
 	// reading stdin (a failed SPDY/TLS upgrade).
@@ -29,6 +31,8 @@ type fakeExecutor struct {
 	endErr  error
 	// finished is closed when StreamWithContext returns.
 	finished chan struct{}
+	// readerDone is closed when the stdin reader has stopped (non-echo streams).
+	readerDone chan struct{}
 }
 
 func (f *fakeExecutor) Stream(_ remotecommand.StreamOptions) error {
@@ -51,9 +55,13 @@ func (f *fakeExecutor) StreamWithContext(ctx context.Context, opts remotecommand
 	go func() {
 		if f.echo {
 			_, _ = io.Copy(opts.Stdout, opts.Stdin)
-		} else {
-			_, _ = io.Copy(io.Discard, opts.Stdin)
+			return
 		}
+		if f.readerDone != nil {
+			defer close(f.readerDone)
+		}
+		// A single read is enough to signal readiness; stop consuming afterwards.
+		_, _ = opts.Stdin.Read(make([]byte, 1))
 	}()
 
 	select {
@@ -155,13 +163,16 @@ func TestNewExecConnStreamEndPropagates(t *testing.T) {
 	t.Run("stream ends with an error", func(t *testing.T) {
 		streamErr := errors.New("exec stream terminated")
 		fe := &fakeExecutor{
-			unblock: make(chan struct{}),
-			endErr:  streamErr,
+			unblock:    make(chan struct{}),
+			endErr:     streamErr,
+			readerDone: make(chan struct{}),
 		}
 
 		conn, err := newExecConn(context.Background(), fe)
 		require.NoError(t, err)
+
 		close(fe.unblock)
+		waitClosed(t, fe.readerDone)
 
 		_, err = conn.Read(make([]byte, 16))
 		require.ErrorIs(t, err, streamErr)
@@ -171,11 +182,16 @@ func TestNewExecConnStreamEndPropagates(t *testing.T) {
 	})
 
 	t.Run("stream ends with no error", func(t *testing.T) {
-		fe := &fakeExecutor{unblock: make(chan struct{})}
+		fe := &fakeExecutor{
+			unblock:    make(chan struct{}),
+			readerDone: make(chan struct{}),
+		}
 
 		conn, err := newExecConn(context.Background(), fe)
 		require.NoError(t, err)
+
 		close(fe.unblock)
+		waitClosed(t, fe.readerDone)
 
 		_, err = conn.Read(make([]byte, 16))
 		require.ErrorIs(t, err, io.EOF)
@@ -202,4 +218,13 @@ func TestNewExecConnStreamEndPropagates(t *testing.T) {
 		case <-time.After(200 * time.Millisecond):
 		}
 	})
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("fake executor kept reading stdin after the stream ended")
+	}
 }
